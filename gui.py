@@ -42,7 +42,7 @@ class NetworkCanvas(FigureCanvas):
     def draw_graph(self, G: nx.Graph, status: dict, show_labels: bool = False):
         """Draws the graph with updated color and size scheme."""
         self.ax.clear()
-        pos = nx.spring_layout(G, seed=42)
+        pos = nx.spring_layout(G, seed=42, k=7 / np.sqrt(len(G)))
 
         color_map = []
         sizes = []
@@ -81,6 +81,7 @@ class MainWindow(QWidget):
         self.timer = QtCore.QTimer()
         self.timer.setInterval(800)  # ms
         self.timer.timeout.connect(self._auto_step)
+        self.score = 0
 
         self._init_ui()
         self._refresh()
@@ -117,14 +118,16 @@ class MainWindow(QWidget):
         self.spin_budget = QSpinBox(); self.spin_budget.setRange(0, 100); self.spin_budget.setValue(self.env.daily_budget)
         hp2.addWidget(self.spin_budget)
         right.addLayout(hp2)
-
         # Agent selection
         right.addWidget(QLabel('Agent'))
         self.btn_agent_heur = QPushButton('Heuristic (degree)')
+        self.btn_agent_heur.clicked.connect(lambda: self._set_agent('heur'))
+        right.addWidget(self.btn_agent_heur)
+
         self.btn_agent_random = QPushButton('Random')
         self.btn_agent_mcts = QPushButton('MCTS (stub)')
         self.btn_agent_rl = QPushButton('RL-GNN (stub)')
-        self.btn_agent_heur.clicked.connect(lambda: self._set_agent('heur'))
+        
         self.btn_agent_random.clicked.connect(lambda: self._set_agent('rand'))
         self.btn_agent_mcts.clicked.connect(lambda: self._set_agent('mcts'))
         self.btn_agent_rl.clicked.connect(lambda: self._set_agent('rl'))
@@ -183,6 +186,8 @@ class MainWindow(QWidget):
 
         # status
         self.status_label = QLabel('Day: 0 | S:0 I:0 R:0')
+        self.score_label = QLabel('Score: 0')
+        right.addWidget(self.score_label)
         right.addWidget(self.status_label)
 
         # checkbox for showing node ids (slow)
@@ -195,6 +200,55 @@ class MainWindow(QWidget):
         main_layout.addLayout(right, 1)
 
         self.setLayout(main_layout)
+
+    def run_heuristic_agent(self):
+        """Run one step using the HeuristicAgent."""
+        if not hasattr(self, 'env'):
+            self.log.append("⚠️ Environment not initialized!")
+            return
+
+        agent = HeuristicAgent(self.env)
+        state = {'status': self.env.status.copy()}
+
+        selected_nodes = agent.getAction(state, budget=self.env.daily_budget)
+        self.env.inoculate(selected_nodes)
+
+        self.log.append(f"Heuristic agent inoculated nodes: {selected_nodes}")
+
+        # Step the environment one day forward
+        summary = self.env.step()
+
+        # Update score and UI
+        self._update_score()
+        self._refresh()
+
+        # Log infection progress
+        self.log.append(
+            f"Day {summary['day']} → Infected: {len(summary['newly_infected'])}, "
+            #f"Cured: {len(summary['newly_cured'])}"
+        )
+
+        # Check for end of episode
+        self._check_game_over()
+
+
+
+
+    def _check_game_over(self):
+        counts = self.env.counts()
+        total = counts['susceptible'] + counts['infected'] + counts['inoculated']
+        
+        # Stop if all nodes are either infected or inoculated (no susceptible left)
+        if counts['susceptible'] == 0 or counts['infected'] + counts['inoculated'] == total:
+            self.timer.stop()
+            from PyQt5.QtWidgets import QMessageBox
+            msg = QMessageBox()
+            msg.setWindowTitle("Game Over")
+            msg.setText(f"Game Over!\nScore achieved: {self.score}")
+            msg.exec_()
+            return True
+        return False
+
 
     def _set_agent(self, which: str):
         if which == 'heur':
@@ -220,6 +274,9 @@ class MainWindow(QWidget):
         # Recreate env with new parameters
         self.env = RumorEnv(n_nodes=nodes, m_edges=m, p_infect=p, initial_infected=1, daily_budget=budget)
         # If agent needs env reference, update (Heuristic/MCTS)
+        self.score = 0
+        self.score_label.setText("Score: 0")
+
         if isinstance(self.agent, HeuristicAgent) or isinstance(self.agent, MCTSAgent):
             try:
                 self.agent.env = self.env
@@ -230,6 +287,10 @@ class MainWindow(QWidget):
 
     def _manual_step(self):
         summary = self.env.step()
+        self._update_score()
+        if self._check_game_over():
+            return
+
         self.log.append(f"Day {summary['day']}: newly infected {len(summary['newly_infected'])} nodes")
         self._refresh()
 
@@ -250,6 +311,9 @@ class MainWindow(QWidget):
         changed = self.env.inoculate(nodes)
         self.log.append(f'Inoculated {changed} nodes: {nodes}')
         summary = self.env.step()
+        self._update_score()
+        if self._check_game_over():
+            return
         self.log.append(f"Day {summary['day']}: newly infected {len(summary['newly_infected'])} nodes; counts: {summary['counts']}")
         self._refresh()
 
@@ -295,6 +359,24 @@ class MainWindow(QWidget):
                 filtered.append(x)
         return filtered
 
+    def _update_score(self):
+        """
+        Compute score from scratch using:
+        score = 10 * cured_count - 5 * infected_count - 2 * days_passed
+        This does NOT accumulate; it computes fresh each time from env counts/day.
+        """
+        counts = self.env.counts()
+        cured = counts.get('inoculated', 0)   # cured/inoculated count
+        infected = counts.get('infected', 0)
+        days = int(self.env.day)
+
+        score = 10 * cured - 5 * infected - 2 * days
+        # store & display
+        self.score = score
+        self.score_label.setText(f"Score: {self.score}")
+
+
+
     def _user_play(self):
         text = self.user_input.text()
         if text.strip() == '':
@@ -317,6 +399,10 @@ class MainWindow(QWidget):
         changed = self.env.inoculate(nodes)
         self.log.append(f'User inoculated {changed} nodes: {nodes}')
         summary = self.env.step()
+        self._update_score()
+        if self._check_game_over():
+            return
+
         self.log.append(f"Day {summary['day']}: newly infected {len(summary['newly_infected'])} nodes; counts: {summary['counts']}")
         self._refresh()
 
