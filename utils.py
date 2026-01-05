@@ -7,8 +7,25 @@ Helper utilities for the project (log saving, node lists, and GNN encoding stub)
 import datetime
 from typing import List
 from environment import RumorEnv
+import os
+import random
+from collections import deque
 
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.buffer = deque(maxlen=capacity)
 
+    def push(self, state, action, reward, next_state, done):
+        """Save a transition"""
+        self.buffer.append((state, action, reward, next_state, done))
+
+    def sample(self, batch_size):
+        """Randomly sample a batch of experiences"""
+        return random.sample(self.buffer, batch_size)
+
+    def __len__(self):
+        return len(self.buffer)
+    
 def current_time_str():
     return datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
 

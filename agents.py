@@ -1,28 +1,30 @@
 """
 agents.py
 
-Contains agent implementations / stubs for the Rumor Spread project.
+Contains agent implementations for the Rumor Spread project.
 
 Provides:
  - BaseAgent
  - RandomAgent
  - HeuristicAgent
  - MCTSAgent
- - RLDQLAgent (stub)
- - RLGNNAgent (stub)
- - RLAgent (alias to RLGNNAgent for backward compatibility)
+ - RLDQLAgent 
+ - GNNAgent 
 """
 
 import random
 import copy
 import math
 from typing import List, Dict, Optional
+import networkx as nx
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from collections import deque, namedtuple
 import numpy as np
 from environment import RumorEnv
+from torch_geometric.nn import SAGEConv
+import torch.optim as optim
 
 
 # -------------------------
@@ -77,13 +79,21 @@ class RandomAgent(BaseAgent):
 
     def getAction(self, state: Dict, budget: int) -> List[int]:
         if self.env is None:
-            raise RuntimeError("RandomAgent requires env reference (pass env to constructor or assign .env).")
-        sus = _extract_susceptible_nodes(self.env, state)
-        if not sus:
+            raise RuntimeError("RandomAgent requires env reference.")
+        
+        # Filter explicitly for SUSCEPTIBLE nodes only.
+        # This prevents picking nodes that are already inoculated or infected.
+        susceptible_nodes = [n for n, status in self.env.status.items() if status == RumorEnv.SUS]
+        
+        # If no one is left to vaccinate, do nothing
+        if not susceptible_nodes:
             return []
-        k = min(budget, len(sus))
-        # choose actual node IDs
-        return list(np.random.choice(sus, size=k, replace=False))
+            
+        # Pick k unique nodes from the VALID pool only
+        k = min(budget, len(susceptible_nodes))
+        selected = random.sample(susceptible_nodes, k)
+        
+        return [int(x) for x in selected]
 
 
 # -------------------------
@@ -99,7 +109,6 @@ class HeuristicAgent(BaseAgent):
         # Prefer authoritative source: env.status
         sus = [n for n, st in self.env.status.items() if st == RumorEnv.SUS]
 
-        # If that happens to be empty (unlikely), try extracting from provided state
         if not sus:
             sus = _extract_susceptible_nodes(self.env, state)
 
@@ -265,7 +274,7 @@ class ReplayMemory(object):
 
 class RLDQLAgent(BaseAgent):
     """
-    Placeholder stub for an RL agent using Deep Q-Learning.
+    RL agent using Deep Q-Learning.
     Implement training/inference and return top-k node ids by Q-values.
     """
     def __init__(self, env: Optional[RumorEnv] = None, learning_rate = 0.001):
@@ -288,23 +297,23 @@ class RLDQLAgent(BaseAgent):
         model_path = 'models/dqn_baseline.pth'
 
         if os.path.exists(model_path):
-            # 1. Load the weights from the file
+            # Load the weights from the file
             self.policy_net.load_state_dict(torch.load(model_path, map_location=self.device))
 
-            # 2. Set to Evaluation Mode (tells PyTorch we are not training)
+            # Set to Evaluation Mode (tells PyTorch we are not training)
             self.policy_net.eval()
 
             self.epsilon = 0.0
 
-            print(f"✅ Loaded trained model from {model_path}")
+            print(f"Loaded trained model from {model_path}")
         else:
-            print(f"⚠️ No trained model found at {model_path}. Running with random weights.")
+            print(f"No trained model found at {model_path}. Running with random weights.")
 
 
     def getAction(self, state: Dict, budget: int) -> List[int]:
         if self.env is None:
             raise RuntimeError("RLDQLAgent requires env reference")
-        # 1. Identify valid (susceptible) nodes
+        # Identify valid (susceptible) nodes
         # We can only inoculate nodes that are currently SUSCEPTIBLE (0)
         # state['status'] is a numpy array e.g., [0, 1, 0, 2...]
         susceptible_mask = (state['status'] == RumorEnv.SUS)
@@ -323,16 +332,16 @@ class RLDQLAgent(BaseAgent):
 
         # --- EXPLOITATION (Neural Network) ---
         else:
-            # 1. Prepare Input
+            # Prepare Input
             # Convert status array to a Float Tensor on the correct device
             # We add a batch dimension [1, 120] because the NN expects batches
             status_tensor = torch.FloatTensor(state['status']).unsqueeze(0).to(self.device)
 
-            # 2. Ask the Network
+            # Ask the Network
             with torch.no_grad():  # We are not training, so turn off gradients
                 q_values = self.policy_net(status_tensor)  # Shape: [1, 120]
 
-            # 3. Masking (CRITICAL STEP)
+            # Masking
             # The network might be dumb and try to pick an Infected node.
             # We force the Q-values of invalid nodes to be -Infinity.
 
@@ -347,7 +356,7 @@ class RLDQLAgent(BaseAgent):
             # Where valid_mask is True, keep q_values. Where False, set to -inf.
             masked_q_values = torch.where(valid_mask_tensor, q_values, minus_inf)
 
-            # 4. Pick Top-K
+            # Pick Top-K
             # shape[1] because shape is [1, 120]
             top_k_values, top_k_indices = torch.topk(masked_q_values, k=k)
 
@@ -362,16 +371,16 @@ class RLDQLAgent(BaseAgent):
         3. Calculate the 'Target' Q-value (from Target Net + Reward).
         4. Calculate Loss (difference) and update weights.
         """
-        # 1. Don't train if we don't have enough memories yet
+        # Don't train if we don't have enough memories yet
         if len(self.memory) < self.batch_size:
             return
 
-        # 2. Sample a random batch
+        # Sample a random batch
         transitions = self.memory.sample(self.batch_size)
         # Unzip the batch (turn a list of Transitions into a Transition of lists)
         batch = Transition(*zip(*transitions))
 
-        # 3. Convert to Tensors (and move to GPU if available)
+        # Convert to Tensors (and move to GPU if available)
         # Note: We stack them to create a batch dimension
         state_batch = torch.FloatTensor(np.array(batch.state)).to(self.device)
         action_batch = torch.LongTensor(batch.action).unsqueeze(1).to(self.device)  # Shape [64, 1]
@@ -379,27 +388,27 @@ class RLDQLAgent(BaseAgent):
         next_state_batch = torch.FloatTensor(np.array(batch.next_state)).to(self.device)
         done_batch = torch.FloatTensor(batch.done).to(self.device)
 
-        # 4. Compute Q(s, a) - The Agent's Prediction
+        # Compute Q(s, a) - The Agent's Prediction
         # We pass the state batch through the policy net.
         # .gather(1, action_batch) picks ONLY the Q-value for the action we actually took.
         state_action_values = self.policy_net(state_batch).gather(1, action_batch).squeeze(1)
 
-        # 5. Compute V(s') - The Target Value
+        # Compute V(s') - The Target Value
         # We use the Target Network to predict the best future value.
         with torch.no_grad():
             # max(1)[0] gives the max Q-value for the next state
             next_state_values = self.target_net(next_state_batch).max(1)[0]
 
-        # 6. Compute Expected Q = Reward + Gamma * V(s')
+        # Compute Expected Q = Reward + Gamma * V(s')
         # If done is 1, (1-done) becomes 0, so future value is ignored (correct for game over).
         expected_state_action_values = reward_batch + (self.gamma * next_state_values * (1 - done_batch))
 
-        # 7. Compute Loss
+        # Compute Loss
         # We use SmoothL1Loss (Huber Loss) which is stable for RL
         criterion = nn.SmoothL1Loss()
         loss = criterion(state_action_values, expected_state_action_values)
 
-        # 8. Optimize the Model
+        # Optimize the Model
         self.optimizer.zero_grad()  # Clear old gradients
         loss.backward()  # Calculate new gradients
         # Clip gradients to prevent exploding gradients (stability trick)
@@ -416,27 +425,125 @@ class RLDQLAgent(BaseAgent):
         """Copy weights from Policy Net to Target Net"""
         self.target_net.load_state_dict(self.policy_net.state_dict())
 
-class RLGNNAgent(BaseAgent):
-    """
-    Placeholder stub for a GNN-based agent.
-    Implement node-embedding + policy/Q head and return top-k node ids.
-    """
-    def __init__(self, env: Optional[RumorEnv] = None):
-        super().__init__("RL-GNN")
+# --- GNN AGENT (GraphSAGE) ---
+
+class GraphSAGE(nn.Module):
+    def __init__(self, in_channels, hidden_dim, out_channels):
+        super(GraphSAGE, self).__init__()
+        # Use hidden_dim passed from the agent
+        self.conv1 = SAGEConv(in_channels, hidden_dim, aggr='max')
+        self.conv2 = SAGEConv(hidden_dim, hidden_dim, aggr='max')
+        self.lin = nn.Linear(hidden_dim, out_channels)
+        
+    def forward(self, x, edge_index):
+        h = self.conv1(x, edge_index)
+        h = F.relu(h)
+        h = self.conv2(h, edge_index)
+        h = F.relu(h)
+        out = self.lin(h)
+        return out.squeeze(1)
+
+class GNNAgent:
+    def __init__(self, env, hidden_dim=64, learning_rate=0.002):
         self.env = env
+        # Input Features = 3 (Status, Degree, Clustering)
+        self.input_feat = 3 
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    def getAction(self, state: Dict, budget: int) -> List[int]:
-        # TODO: encode graph + state, run GNN, pick top-k nodes by score
-        if self.env is None:
-            raise RuntimeError("RLGNNAgent requires env reference")
-        sus = _extract_susceptible_nodes(self.env, state)
-        if not sus:
-            return []
-        k = min(budget, len(sus))
-        return list(np.random.choice(sus, size=k, replace=False))
+        self.policy_net = GraphSAGE(self.input_feat, hidden_dim, 1).to(self.device)
+        self.target_net = GraphSAGE(self.input_feat, hidden_dim, 1).to(self.device)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.target_net.eval()
 
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=learning_rate)
+        
+        # Load model if exists
+        import os
+        model_path = 'models/gnn_policy.pth'
+        if os.path.exists(model_path):
+            try:
+                state_dict = torch.load(model_path, map_location=self.device)
+                if state_dict['conv1.lin_l.weight'].shape[1] == self.input_feat:
+                    self.policy_net.load_state_dict(state_dict)
+                    self.target_net.load_state_dict(self.policy_net.state_dict())
+                    self.epsilon = 0.0
+                    print(f"GNN Agent loaded from {model_path}")
+                else:
+                    print("Model dimension mismatch (New Features). Retraining from scratch.")
+                    self.epsilon = 1.0
+            except Exception as e:
+                print(f"Could not load GNN model: {e}")
+                self.epsilon = 1.0
+        else:
+            print("No trained GNN model found. Agent will be random unless trained.")
+            self.epsilon = 1.0
 
-# Keep backward-compatible name RLAgent -> use GNN stub by default
-class RLAgent(RLGNNAgent):
-    def __init__(self, env: Optional[RumorEnv] = None):
-        super().__init__(env)
+        self.epsilon_min = 0.01
+        self.epsilon_decay = 0.995
+        self.gamma = 0.99
+
+    def _get_graph_data(self, state):
+        # Status Feature
+        status = np.array(state['status'], dtype=np.float32).reshape(-1, 1)
+        
+        # CACHED Betweenness (Instant access)
+        if hasattr(self.env, 'cached_betweenness') and self.env.cached_betweenness is not None:
+            betweenness = self.env.cached_betweenness
+             
+             
+            if hasattr(self.env, 'G'):
+                degrees = np.array([d for n, d in self.env.G.degree()], dtype=np.float32)
+            else:
+                degrees = np.sum(state['adj'], axis=1)
+        else:
+             # Fallback 
+             if hasattr(self.env, 'G'):
+                 bet_map = nx.betweenness_centrality(self.env.G, normalized=True)
+                 betweenness = np.array([bet_map[n] for n in sorted(self.env.G.nodes())], dtype=np.float32)
+                 degrees = np.array([d for n, d in self.env.G.degree()], dtype=np.float32)
+             else:
+                 degrees = np.sum(state['adj'], axis=1)
+                 betweenness = np.zeros_like(degrees)
+             
+        if degrees.max() > 0: degrees /= degrees.max()
+        # Betweenness is already normalized in environment.py
+
+        # Stack Features
+        x_data = np.column_stack((status, degrees, betweenness))
+        x = torch.tensor(x_data, dtype=torch.float).to(self.device)
+
+        # Edges
+        if hasattr(self.env, 'G'):
+            edges = list(self.env.G.edges())
+            source = [s for s, t in edges] + [t for s, t in edges]
+            target = [t for s, t in edges] + [s for s, t in edges]
+            edge_index = torch.tensor([source, target], dtype=torch.long).to(self.device)
+        else:
+            rows, cols = np.where(state['adj'] > 0)
+            edge_index = torch.tensor([rows, cols], dtype=torch.long).to(self.device)
+
+        return x, edge_index
+    
+    def getAction(self, state, budget=1):
+        susceptible_mask = (state['status'] == 0)
+        valid_indices = np.where(susceptible_mask)[0]
+
+        if len(valid_indices) == 0: return []
+        k = min(budget, len(valid_indices))
+        
+        if random.random() < self.epsilon:
+            return list(np.random.choice(valid_indices, size=k, replace=False))
+            
+        x, edge_index = self._get_graph_data(state)
+        self.policy_net.eval()
+        with torch.no_grad():
+            q_values = self.policy_net(x, edge_index)
+            
+        minus_inf = torch.tensor(float('-inf')).to(self.device)
+        valid_mask_tensor = torch.tensor(susceptible_mask).to(self.device)
+        masked_q = torch.where(valid_mask_tensor, q_values.squeeze(), minus_inf)
+        
+        if k > 0:
+            top_k = torch.topk(masked_q, k)
+            return top_k.indices.cpu().numpy().tolist()
+        return []
